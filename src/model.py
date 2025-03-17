@@ -7,8 +7,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import scanpy as sc
 from anndata import AnnData
 from sklearn.neighbors import NearestNeighbors
-import torch_geometric
-from torch_geometric.nn import GCNConv, GATConv
+import torch_geometric.nn
 import torch.nn as nn
 
 from utils import *
@@ -19,6 +18,7 @@ class joint_model(torch.nn.Module):
             self,
             xe: AnnData,
             vi: AnnData,
+            gamma: np.ndarray,
             n_factors: int,
             lambda_x: float = 1.0,
             lambda_v: float = 1.0,
@@ -33,8 +33,8 @@ class joint_model(torch.nn.Module):
             k_neighbors_xenium: int = 40,
             k_neighbors_visium: int = 15,
             gcn_hidden_dim: int = 64,
-            gat_heads: int = 4,
-            gat_dropout: float = 0.2,
+            gat_heads: int = 1,
+            gat_dropout: float = 0.1,
         ):
         super().__init__()
         self.xe = xe
@@ -61,6 +61,8 @@ class joint_model(torch.nn.Module):
         self.X = torch.tensor(to_dense_mat(self.xe, 0), dtype=torch.float32).to(device)
         self.V = torch.tensor(to_dense_mat(self.vi, 0), dtype=torch.float32).to(device)
 
+        self.gamma = torch.tensor(gamma, dtype=torch.float32).to(device)
+
         # Get spatial coordinates
         self.xenium_coords = torch.tensor(self.xe.obsm['spatial'], dtype=torch.float32).to(device)
         self.visium_coords = torch.tensor(self.vi.obsm['spatial'], dtype=torch.float32).to(device)
@@ -76,7 +78,7 @@ class joint_model(torch.nn.Module):
         self.W = torch.nn.Parameter(
             torch.randn((self.n_factors, self.num_genes), dtype=torch.float32).to(device)
             )
-        # self.scale_factor_xenium = torch.nn.Parameter(torch.ones((self.num_xenium_cells, 1), dtype=torch.float32).to(device))
+        # self.scale_factor_xenium = torch.nn.Parameter(torch.ones((self.num_xenium_cells, 1), dtype=torch.float32).to(device)) # TODO:
         self.scale_factor_visium = torch.nn.Parameter(torch.ones((self.num_visium_cells, 1), dtype=torch.float32).to(device))
         
         # self.platform_sf_visium = torch.nn.Parameter(torch.randn((1, self.num_genes), dtype=torch.float32).to(device))
@@ -84,20 +86,28 @@ class joint_model(torch.nn.Module):
 
         
         # Initialize GCN layers for spatial smoothing
-        self.gcn_layers = nn.ModuleList()
-        self.gcn_layers.append(GCNConv(self.n_factors, gcn_hidden_dim))
-        self.gcn_layers.append(GCNConv(gcn_hidden_dim, self.n_factors))
-        self.gcn_layers = self.gcn_layers.to(self.device)
+        # self.gcn_layers = nn.ModuleList()
+        # self.gcn_layers.append(GCNConv(self.n_factors, self.n_factors))
+        # self.gcn_layers.append(GCNConv(self.n_factors, self.n_factors))
+        # self.gcn_layers = self.gcn_layers.to(self.device)
 
-        # Initialize GAT layer for Visium feature computation
-        self.visium_gat = GATConv(
+        self.xenium_gat = torch_geometric.nn.GATConv(
             in_channels=self.n_factors,
             out_channels=self.n_factors,
             heads=gat_heads,
             dropout=gat_dropout,
             concat=False  # Average the attention heads
         ).to(self.device)
-
+        """
+        # Initialize GAT layer for Visium feature computation
+        self.visium_gat = torch_geometric.nn.GATConv(
+            in_channels=self.n_factors,
+            out_channels=self.n_factors,
+            heads=gat_heads,
+            dropout=gat_dropout,
+            concat=False  # Average the attention heads
+        ).to(self.device)
+        """
         # Initialize the learnable parameters
         torch.nn.init.xavier_uniform_(self.Px)
         torch.nn.init.xavier_uniform_(self.W)
@@ -117,22 +127,22 @@ class joint_model(torch.nn.Module):
         edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous().to(self.device)
         self.edge_index = edge_index
         
-        # Also build visium to xenium mapping for local graph attention
-        visium_coords_np = self.visium_coords.cpu().numpy()
-        nbrs_v2x = NearestNeighbors(n_neighbors=self.k_neighbors_visium, algorithm='ball_tree').fit(xenium_coords_np)
-        _, v2x_indices = nbrs_v2x.kneighbors(visium_coords_np)
-        
-        # Create edge index for visium to xenium
+        # Use gamma matrix to build visium to xenium mapping instead of nearest neighbors
+        # gamma shape should be (num_visium_cells, num_xenium_cells)
         v2x_edge_list = []
-        for i in range(len(v2x_indices)):
-            for j in v2x_indices[i]:
+        
+        # For each Visium spot, find the top k Xenium cells with highest gamma values
+        gamma_np = self.gamma.cpu().numpy()
+        for i in range(self.num_visium_cells):
+            # Get indices of top k Xenium cells for this Visium spot
+            top_xenium_indices = np.argsort(gamma_np[i])[-self.k_neighbors_visium:]
+            for j in top_xenium_indices:
                 v2x_edge_list.append([i, j])
         
         self.v2x_edge_index = torch.tensor(v2x_edge_list, dtype=torch.long).t().contiguous().to(self.device)
     
     def prepare_bipartite_graph(self):
-        # Prepare edge indices for the bipartite graph
-        # Convert v2x_edge_index to the format needed for the combined graph
+        # Prepare edge indices for the bipartite graph using gamma-based connections
         # Original: [visium_idx, xenium_idx]
         # New: [visium_idx, xenium_idx + num_visium_cells]
         visium_indices = self.v2x_edge_index[0]
@@ -158,29 +168,19 @@ class joint_model(torch.nn.Module):
     def xenium_factors(self):
         # Apply GCN to smooth the factor matrix
         x = self.F_soft
-        for i, conv in enumerate(self.gcn_layers):
-            x = conv(x, self.edge_index)
-            if i < len(self.gcn_layers) - 1:
-                x = F.relu(x)
-
-        x = F.sigmoid(x) # TODO: sigmoid or softmax?
-        return x
+        # gat
+        x = self.xenium_gat(x, self.edge_index)
+        return torch.nn.Softmax(dim=1)(x)
     
     @property
     def visium_factors(self):
-        # Create node features for the combined graph
-        x = self.F_soft
-        combined_features = torch.cat([
-            torch.zeros((self.num_visium_cells, self.n_factors), device=self.device),
-            x  # Xenium cell features
-        ], dim=0)
+        # Instead of using GAT, use gamma to compute visium factors as weighted sum of xenium factors
+        x = self.xenium_factors
         
-        # Apply GAT to compute Visium features through attention-weighted aggregation
-        updated_features = self.visium_gat(combined_features, self.visium_edge_index)
+        # Compute visium factors as weighted sum of xenium factors
+        visium_features = torch.mm(self.gamma.T, x)
         
-        # Extract the updated Visium features (first num_visium_cells rows)
-        visium_features = updated_features[:self.num_visium_cells]
-
+        # Apply softmax to ensure proper normalization
         visium_features = torch.nn.Softmax(dim=1)(visium_features)
         return visium_features
     
@@ -192,6 +192,7 @@ class joint_model(torch.nn.Module):
         # Use the spatially smoothed factors F and the new loading matrix W
         w = self.W_soft[:, :end_at] * torch.exp(self.gene_sf[:, :end_at])
         ret = torch.mm(self.xenium_factors, w)
+        # ret = torch.exp(self.scale_factor_xenium) * ret
         return ret
 
     def get_visium_est(self):
@@ -291,11 +292,13 @@ class joint_model(torch.nn.Module):
         train_tensors = [self.Px, self.W, self.gene_sf, self.scale_factor_visium]
             
         # Add GCN parameters
-        for layer in self.gcn_layers:
-            train_tensors.extend(list(layer.parameters()))
+        # for layer in self.gcn_layers:
+        #     train_tensors.extend(list(layer.parameters()))
         
         # Add GAT parameters for Visium feature computation
-        train_tensors.extend(list(self.visium_gat.parameters()))
+        # train_tensors.extend(list(self.visium_gat.parameters()))
+
+        train_tensors.extend(list(self.xenium_gat.parameters()))
         
         optimizer = torch.optim.Adam(train_tensors, lr=lr)
         if warm_restart:
@@ -352,6 +355,7 @@ class joint_model(torch.nn.Module):
                     'W': self.W.clone(),
                     'gene_sf': self.gene_sf.clone(),
                     'scale_factor_visium': self.scale_factor_visium.clone(),
+                    # 'scale_factor_xenium': self.scale_factor_xenium.clone(),
                 }
             
             if self.callback(epoch, run_loss, print_freq=print_freq):
@@ -365,6 +369,7 @@ class joint_model(torch.nn.Module):
                 self.W.copy_(best_state['W'])
                 self.gene_sf.copy_(best_state['gene_sf'])
                 self.scale_factor_visium.copy_(best_state['scale_factor_visium'])
+                # self.scale_factor_xenium.copy_(best_state['scale_factor_xenium'])
 
         # Return items of interest
         with torch.no_grad():
@@ -373,6 +378,7 @@ class joint_model(torch.nn.Module):
                 "W": dcn(self.W_soft),  # Return the new loading matrix
                 "gene_sf": dcn(self.gene_sf),
                 "scale_factor_visium": dcn(self.scale_factor_visium),
+                # "scale_factor_xenium": dcn(self.scale_factor_xenium),
                 "training_history": training_history,
                 "losses": losses
             }

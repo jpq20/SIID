@@ -2,8 +2,42 @@ import torch
 import numpy as np
 from anndata import AnnData
 import scanpy as sc
+from scipy.spatial import KDTree
+from scipy.sparse import issparse
 
-def prepare_data(vi_, xe_, holdouts):
+
+def gen_gamma(vi_sp, xe_sp, max_radius = 100, exclusive = True):
+    """
+    Generate a binary assignment matrix (gamma) between Xenium cells and Visium spots.
+    
+    Parameters:
+    -----------
+    vi_sp : numpy.ndarray
+        Spatial coordinates of Visium spots, shape (n_spots, 2)
+    xe_sp : numpy.ndarray
+        Spatial coordinates of Xenium cells, shape (n_cells, 2)
+    max_radius : float, default=100
+        Maximum distance threshold for assignment
+    exclusive : bool, default=True
+        If True, each Xenium cell is assigned to at most one Visium spot
+        (Currently only exclusive=True is supported)
+        
+    Returns:
+    --------
+    numpy.ndarray
+        Binary assignment matrix of shape (n_cells, n_spots)
+        Where gamma[i,j] = 1 if Xenium cell i is assigned to Visium spot j
+    """
+    assert exclusive
+    ret = np.zeros((xe_sp.shape[0], vi_sp.shape[0]))
+    kdt = KDTree(vi_sp)
+    for i in range(xe_sp.shape[0]):
+        d, vi_idx = kdt.query(xe_sp[i])  # Find nearest Visium spot for each Xenium cell
+        if d <= max_radius:  # Only assign if within the maximum radius
+            ret[i, vi_idx] = 1
+    return ret
+
+def prepare_data(vi_, xe_, holdouts, n_factors=20, max_radius=100):
     """
     Prepare data for the joint model
     
@@ -15,6 +49,10 @@ def prepare_data(vi_, xe_, holdouts):
         Xenium data
     holdouts : list
         List of genes to hold out for evaluation
+    n_factors : int, default=20
+        Number of factors for NMF
+    max_radius : float, default=100
+        Maximum distance threshold for assignment
     
     Returns:
     --------
@@ -24,6 +62,10 @@ def prepare_data(vi_, xe_, holdouts):
         Processed Xenium data
     gamma : numpy.ndarray
         Assignment matrix between xenium and visium
+    F_vi : numpy.ndarray
+        NMF factors for Visium data
+    F_xe : numpy.ndarray
+        NMF factors for Xenium data
     """
     # Make copies to avoid modifying the original data
     vi, xe = vi_.copy(), xe_.copy()
@@ -51,7 +93,12 @@ def prepare_data(vi_, xe_, holdouts):
     vi_genes = list(train_genes) + list(test_genes)
     sorted_vi = vi[:, vi_genes]
     
-    return sorted_vi, sorted_xe
+    # Generate gamma matrix for cell-spot assignment
+    vi_spatial = sorted_vi.obsm['spatial']
+    xe_spatial = sorted_xe.obsm['spatial']
+    gamma = gen_gamma(vi_spatial, xe_spatial, max_radius=max_radius)
+    
+    return sorted_vi, sorted_xe, gamma
 
 
 # Example usage

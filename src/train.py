@@ -9,8 +9,8 @@ from anndata import AnnData
 
 # Import our data preparation function
 from data import prepare_data
-from model import joint_model
-from eval import evaluate_imputation
+from mm.joint_one_graph.model import joint_model
+from mm.joint_one_graph.eval import evaluate_imputation
 from utils import *
 
 
