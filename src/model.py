@@ -20,6 +20,7 @@ class joint_model(torch.nn.Module):
             xe: AnnData,
             vi: AnnData,
             n_factors: int,
+            lambda_x: float = 1.0,
             lambda_v: float = 1.0,
             lambda_r: float = 1.0,
             l2_w: float = 1e-5,
@@ -39,7 +40,7 @@ class joint_model(torch.nn.Module):
         self.xe = xe
         self.vi = vi
         self.n_factors = n_factors
-        self.lambda_x = xe.shape[0]/vi.shape[0]
+        self.lambda_x = lambda_x
         self.lambda_v = lambda_v
         self.lambda_r = lambda_r
         self.l2_w = l2_w
@@ -75,13 +76,17 @@ class joint_model(torch.nn.Module):
         self.W = torch.nn.Parameter(
             torch.randn((self.n_factors, self.num_genes), dtype=torch.float32).to(device)
             )
+        # self.scale_factor_xenium = torch.nn.Parameter(torch.ones((self.num_xenium_cells, 1), dtype=torch.float32).to(device))
+        self.scale_factor_visium = torch.nn.Parameter(torch.ones((self.num_visium_cells, 1), dtype=torch.float32).to(device))
+        
+        # self.platform_sf_visium = torch.nn.Parameter(torch.randn((1, self.num_genes), dtype=torch.float32).to(device))
+        self.gene_sf = torch.nn.Parameter(torch.randn((1, self.num_genes), dtype=torch.float32).to(device))
+
         
         # Initialize GCN layers for spatial smoothing
         self.gcn_layers = nn.ModuleList()
         self.gcn_layers.append(GCNConv(self.n_factors, gcn_hidden_dim))
-        self.gcn_layers.append(GCNConv(gcn_hidden_dim, int(gcn_hidden_dim/2)))
-        self.gcn_layers.append(GCNConv(int(gcn_hidden_dim/2), int(gcn_hidden_dim)))
-        self.gcn_layers.append(GCNConv(int(gcn_hidden_dim), self.n_factors))
+        self.gcn_layers.append(GCNConv(gcn_hidden_dim, self.n_factors))
         self.gcn_layers = self.gcn_layers.to(self.device)
 
         # Initialize GAT layer for Visium feature computation
@@ -93,24 +98,15 @@ class joint_model(torch.nn.Module):
             concat=False  # Average the attention heads
         ).to(self.device)
 
-        # Initialize learnable weights for spatial aggregation
-        self.spatial_weights = torch.nn.Parameter(
-            torch.ones((self.num_visium_cells, self.k_neighbors_visium), dtype=torch.float32).to(device)
-        )
-
         # Initialize the learnable parameters
         torch.nn.init.xavier_uniform_(self.Px)
         torch.nn.init.xavier_uniform_(self.W)
-
-        self.scale_factor_xenium = torch.nn.Parameter(torch.randn((1, self.num_xenium_genes), dtype=torch.float32).to(device))
-        
-        self.scale_factor_visium = torch.nn.Parameter(torch.randn((1, self.num_genes), dtype=torch.float32).to(device))
 
     def build_spatial_graph(self):
         # Build k-nearest neighbors graph for xenium data
         xenium_coords_np = self.xenium_coords.cpu().numpy()
         nbrs = NearestNeighbors(n_neighbors=self.k_neighbors_xenium+1, algorithm='ball_tree').fit(xenium_coords_np)
-        distances, indices = nbrs.kneighbors(xenium_coords_np)
+        _, indices = nbrs.kneighbors(xenium_coords_np)
         
         # Create edge index for PyTorch Geometric
         edge_list = []
@@ -157,27 +153,23 @@ class joint_model(torch.nn.Module):
     def F_soft(self):
         # Apply softmax to ensure each row sums to 1
         return torch.nn.Softmax(dim=1)(self.Px)
-
-    # Get the estimate of the Xenium counts using the denoised factors
-    def get_xenium_est(self, end_at=None):
-        if end_at is None:
-            end_at = self.num_genes
-
-        # Use the spatially smoothed factors F and the new loading matrix W
-        ret = torch.mm(self.F_soft, self.W_soft[:, :end_at])
-        ret *= torch.exp(self.scale_factor_xenium)
-        return ret
-
-    def get_visium_est(self):
-        # Get the Xenium cell factors
+    
+    @property
+    def xenium_factors(self):
+        # Apply GCN to smooth the factor matrix
         x = self.F_soft
-        
-        # Create a heterogeneous graph connecting Visium spots to Xenium cells
-        # We need to create a bipartite graph where:
-        # - First n_visium nodes are Visium spots
-        # - Next n_xenium nodes are Xenium cells
-        
+        for i, conv in enumerate(self.gcn_layers):
+            x = conv(x, self.edge_index)
+            if i < len(self.gcn_layers) - 1:
+                x = F.relu(x)
+
+        x = F.sigmoid(x) # TODO: sigmoid or softmax?
+        return x
+    
+    @property
+    def visium_factors(self):
         # Create node features for the combined graph
+        x = self.F_soft
         combined_features = torch.cat([
             torch.zeros((self.num_visium_cells, self.n_factors), device=self.device),
             x  # Xenium cell features
@@ -188,13 +180,25 @@ class joint_model(torch.nn.Module):
         
         # Extract the updated Visium features (first num_visium_cells rows)
         visium_features = updated_features[:self.num_visium_cells]
-        # Apply softmax to ensure non-negative features
-        visium_features = torch.nn.Softmax(dim=1)(visium_features)
-        
-        # Generate visium expression using the attention-aggregated features
-        ret = torch.mm(visium_features, self.W_soft)
-        ret *= torch.exp(self.scale_factor_visium)
 
+        visium_features = torch.nn.Softmax(dim=1)(visium_features)
+        return visium_features
+    
+    # Get the estimate of the Xenium counts using the denoised factors
+    def get_xenium_est(self, end_at=None):
+        if end_at is None:
+            end_at = self.num_genes
+
+        # Use the spatially smoothed factors F and the new loading matrix W
+        w = self.W_soft[:, :end_at] * torch.exp(self.gene_sf[:, :end_at])
+        ret = torch.mm(self.xenium_factors, w)
+        return ret
+
+    def get_visium_est(self):
+
+        w = self.W_soft * torch.exp(self.gene_sf)
+        ret = torch.mm(self.visium_factors, w)
+        ret = torch.exp(self.scale_factor_visium) * ret
         return ret
 
     def loss(self, verbose=False, loss_type='poisson', num_epoch=1):
@@ -245,7 +249,7 @@ class joint_model(torch.nn.Module):
             expression_loss = x_loss + v_loss
             
         # Regularization loss for parameters
-        l2_reg_loss = self.l2_w * sum(torch.norm(t, p=2) ** 2 for t in [self.W, self.Px])
+        l2_reg_loss = self.l2_w * sum(torch.norm(t, p=2) ** 2 for t in [self.W, self.Px, self.gene_sf, self.scale_factor_visium])
         
         # Entropy loss to encourage sparse cell type assignments
         entropy_loss = 0
@@ -284,7 +288,7 @@ class joint_model(torch.nn.Module):
 
     def train(self, num_epochs=1000, lr=1e-3, verbose=False, loss_type='poisson', print_freq=100, warm_restart=False):
         print(f"Training the model with {loss_type} loss")
-        train_tensors = [self.Px, self.W]
+        train_tensors = [self.Px, self.W, self.gene_sf, self.scale_factor_visium]
             
         # Add GCN parameters
         for layer in self.gcn_layers:
@@ -314,7 +318,8 @@ class joint_model(torch.nn.Module):
         early_stop = False
         for epoch in range(num_epochs):
             optimizer.zero_grad()
-
+            
+            """
             # Apply GCN to smooth the factor matrix
             x = self.F_soft
             for i, conv in enumerate(self.gcn_layers):
@@ -323,7 +328,7 @@ class joint_model(torch.nn.Module):
                     x = F.relu(x)
             with torch.no_grad():
                 self.Px.copy_(x)
-
+            """
 
             if verbose and epoch % 100 == 0:
                 run_loss = self.loss(verbose=True, loss_type=loss_type, num_epoch=epoch)
@@ -344,10 +349,13 @@ class joint_model(torch.nn.Module):
                 # Save a copy of the model state
                 best_state = {
                     'Px': self.Px.clone(),
-                    'W': self.W.clone()
+                    'W': self.W.clone(),
+                    'gene_sf': self.gene_sf.clone(),
+                    'scale_factor_visium': self.scale_factor_visium.clone(),
                 }
             
             if self.callback(epoch, run_loss, print_freq=print_freq):
+                early_stop = True
                 break
         
         # Restore best model state if we have one and early stopping was triggered
@@ -355,17 +363,21 @@ class joint_model(torch.nn.Module):
             with torch.no_grad():
                 self.Px.copy_(best_state['Px'])
                 self.W.copy_(best_state['W'])
+                self.gene_sf.copy_(best_state['gene_sf'])
+                self.scale_factor_visium.copy_(best_state['scale_factor_visium'])
 
         # Return items of interest
         with torch.no_grad():
             return {
                 "F": dcn(self.F_soft),  # Return the spatially smoothed factors
                 "W": dcn(self.W_soft),  # Return the new loading matrix
+                "gene_sf": dcn(self.gene_sf),
+                "scale_factor_visium": dcn(self.scale_factor_visium),
                 "training_history": training_history,
                 "losses": losses
             }
         
-    def callback(self, epoch, run_loss, patience=50, min_delta=0.001, print_freq=10):
+    def callback(self, epoch, run_loss, patience=100, min_delta=0.001, print_freq=10):
         """
         Callback function called after each training epoch.
         

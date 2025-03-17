@@ -74,6 +74,8 @@ def score_corr(x, y, metric="r2"):
         xf = xf / sum(xf)
         yf = yf / sum(yf)
         return -(np.sum(xf * np.log(xf / yf)) + np.sum(yf * np.log(yf / xf))) / 2
+    elif metric == 'mae':
+        return np.mean(np.abs(xf - yf))
     elif metric == "nnz":
         nnz = xf > 0.1
         count = sum(nnz)
@@ -224,6 +226,7 @@ def evaluate_imputation(true_data, imputed_data, output_dir, normalize=False):
     # Calculate metrics
     r2 = score_corr(true_subset, imputed_subset, metric="r2")
     pcc = score_corr(true_subset, imputed_subset, metric="pcc")
+    mae = score_corr(true_subset, imputed_subset, metric="mae")
     ssim = score_corr(true_subset, imputed_subset, metric="ssim")
     rmse = score_corr(true_subset, imputed_subset, metric="rmse")
     js = score_corr(true_subset, imputed_subset, metric="js")
@@ -235,6 +238,7 @@ def evaluate_imputation(true_data, imputed_data, output_dir, normalize=False):
     
     metrics['r2'] = r2
     metrics['pcc'] = pcc
+    metrics['mae'] = mae
     metrics['ssim'] = ssim
     metrics['rmse'] = rmse
     metrics['js'] = js
@@ -245,6 +249,7 @@ def evaluate_imputation(true_data, imputed_data, output_dir, normalize=False):
     print(f"Evaluation metrics:")
     print(f"  R²: {r2:.4f}")
     print(f"  PCC: {pcc:.4f}")
+    print(f"  MAE: {mae:.4f}")
     print(f"  SSIM: {ssim:.4f}")
     print(f"  RMSE: {-rmse:.4f}")  # Convert back to positive for display
     print(f"  JS: {-js:.4f}")      # Convert back to positive for display
