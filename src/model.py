@@ -23,7 +23,7 @@ class joint_model(torch.nn.Module):
             lambda_x: float = 1.0,
             lambda_v: float = 1.0,
             lambda_r: float = 1.0,
-            l2_w: float = 1e-5,
+            l2_w: float = 1.0,
             entropy_w: float = 1.0,
             adaptive_entropy: bool = False,
             adaptive_entropy_denominator: int = 500,
@@ -78,11 +78,11 @@ class joint_model(torch.nn.Module):
         self.W = torch.nn.Parameter(
             torch.randn((self.n_factors, self.num_genes), dtype=torch.float32).to(device)
             )
-        # self.scale_factor_xenium = torch.nn.Parameter(torch.ones((self.num_xenium_cells, 1), dtype=torch.float32).to(device)) # TODO:
+        self.scale_factor_xenium = torch.nn.Parameter(torch.ones((self.num_xenium_cells, 1), dtype=torch.float32).to(device)) # TODO:
         self.scale_factor_visium = torch.nn.Parameter(torch.ones((self.num_visium_cells, 1), dtype=torch.float32).to(device))
         
         # self.platform_sf_visium = torch.nn.Parameter(torch.randn((1, self.num_genes), dtype=torch.float32).to(device))
-        self.gene_sf = torch.nn.Parameter(torch.randn((1, self.num_genes), dtype=torch.float32).to(device))
+        # self.gene_sf = torch.nn.Parameter(torch.ones((1, self.num_genes), dtype=torch.float32).to(device))
 
         
         # Initialize GCN layers for spatial smoothing
@@ -90,7 +90,7 @@ class joint_model(torch.nn.Module):
         # self.gcn_layers.append(GCNConv(self.n_factors, self.n_factors))
         # self.gcn_layers.append(GCNConv(self.n_factors, self.n_factors))
         # self.gcn_layers = self.gcn_layers.to(self.device)
-
+        
         self.xenium_gat = torch_geometric.nn.GATConv(
             in_channels=self.n_factors,
             out_channels=self.n_factors,
@@ -98,7 +98,7 @@ class joint_model(torch.nn.Module):
             dropout=gat_dropout,
             concat=False  # Average the attention heads
         ).to(self.device)
-        """
+        
         # Initialize GAT layer for Visium feature computation
         self.visium_gat = torch_geometric.nn.GATConv(
             in_channels=self.n_factors,
@@ -107,7 +107,7 @@ class joint_model(torch.nn.Module):
             dropout=gat_dropout,
             concat=False  # Average the attention heads
         ).to(self.device)
-        """
+        
         # Initialize the learnable parameters
         torch.nn.init.xavier_uniform_(self.Px)
         torch.nn.init.xavier_uniform_(self.W)
@@ -127,20 +127,19 @@ class joint_model(torch.nn.Module):
         edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous().to(self.device)
         self.edge_index = edge_index
         
-        # Use gamma matrix to build visium to xenium mapping instead of nearest neighbors
-        # gamma shape should be (num_visium_cells, num_xenium_cells)
+        # Use gamma matrix to build visium to xenium mapping
+        # gamma is a binary matrix where 1 represents an edge and 0 represents no edge
         v2x_edge_list = []
         
-        # For each Visium spot, find the top k Xenium cells with highest gamma values
         gamma_np = self.gamma.cpu().numpy()
         for i in range(self.num_visium_cells):
-            # Get indices of top k Xenium cells for this Visium spot
-            top_xenium_indices = np.argsort(gamma_np[i])[-self.k_neighbors_visium:]
-            for j in top_xenium_indices:
+            # Find all Xenium cells connected to this Visium spot (where gamma[i,j] == 1)
+            connected_xenium_indices = np.where(gamma_np[i] > 0)[0]
+            for j in connected_xenium_indices:
                 v2x_edge_list.append([i, j])
         
         self.v2x_edge_index = torch.tensor(v2x_edge_list, dtype=torch.long).t().contiguous().to(self.device)
-    
+
     def prepare_bipartite_graph(self):
         # Prepare edge indices for the bipartite graph using gamma-based connections
         # Original: [visium_idx, xenium_idx]
@@ -171,18 +170,29 @@ class joint_model(torch.nn.Module):
         # gat
         x = self.xenium_gat(x, self.edge_index)
         return torch.nn.Softmax(dim=1)(x)
-    
+        return x
     @property
     def visium_factors(self):
-        # Instead of using GAT, use gamma to compute visium factors as weighted sum of xenium factors
-        x = self.xenium_factors
+        # Use GAT for visium factors instead of weighted sum
+        # First get the xenium factors
+        x_factors = self.xenium_factors
         
-        # Compute visium factors as weighted sum of xenium factors
-        visium_features = torch.mm(self.gamma.T, x)
+        # Create a combined feature tensor for both visium and xenium nodes
+        # Initialize visium features with the weighted sum approach as initial features
+        initial_visium_features = torch.mm(self.gamma.T, x_factors)
+        
+        # Combine features for the bipartite graph
+        combined_features = torch.cat([initial_visium_features, x_factors], dim=0)
+        
+        # Apply GAT on the bipartite graph
+        updated_features = self.visium_gat(combined_features, self.visium_edge_index)
+        
+        # Extract only the visium part from the updated features
+        visium_features = updated_features[:self.num_visium_cells]
         
         # Apply softmax to ensure proper normalization
-        visium_features = torch.nn.Softmax(dim=1)(visium_features)
-        return visium_features
+        # return initial_visium_features
+        return torch.nn.Softmax(dim=1)(visium_features)
     
     # Get the estimate of the Xenium counts using the denoised factors
     def get_xenium_est(self, end_at=None):
@@ -190,14 +200,14 @@ class joint_model(torch.nn.Module):
             end_at = self.num_genes
 
         # Use the spatially smoothed factors F and the new loading matrix W
-        w = self.W_soft[:, :end_at] * torch.exp(self.gene_sf[:, :end_at])
+        w = self.W_soft[:, :end_at]
         ret = torch.mm(self.xenium_factors, w)
-        # ret = torch.exp(self.scale_factor_xenium) * ret
+        ret = torch.exp(self.scale_factor_xenium) * ret
         return ret
 
     def get_visium_est(self):
 
-        w = self.W_soft * torch.exp(self.gene_sf)
+        w = self.W_soft
         ret = torch.mm(self.visium_factors, w)
         ret = torch.exp(self.scale_factor_visium) * ret
         return ret
@@ -250,7 +260,7 @@ class joint_model(torch.nn.Module):
             expression_loss = x_loss + v_loss
             
         # Regularization loss for parameters
-        l2_reg_loss = self.l2_w * sum(torch.norm(t, p=2) ** 2 for t in [self.W, self.Px, self.gene_sf, self.scale_factor_visium])
+        l2_reg_loss = self.l2_w * sum(torch.norm(t, p=2) ** 2 for t in [self.W, self.Px, self.scale_factor_visium, self.scale_factor_xenium])
         
         # Entropy loss to encourage sparse cell type assignments
         entropy_loss = 0
@@ -262,9 +272,9 @@ class joint_model(torch.nn.Module):
             else:
                 entropy_loss = (self.entropy_w) * torch.mean(torch.sum(self.F_soft * torch.log(self.F_soft + 1e-12), dim=1))
 
-        l2_reg_loss -= entropy_loss
+        # l2_reg_loss -= entropy_loss
 
-        total_loss = expression_loss + l2_reg_loss
+        total_loss = expression_loss + l2_reg_loss - entropy_loss
 
         if verbose:
             term_members = [dcn(x_loss), dcn(v_loss), dcn(l2_reg_loss)]
@@ -289,14 +299,14 @@ class joint_model(torch.nn.Module):
 
     def train(self, num_epochs=1000, lr=1e-3, verbose=False, loss_type='poisson', print_freq=100, warm_restart=False):
         print(f"Training the model with {loss_type} loss")
-        train_tensors = [self.Px, self.W, self.gene_sf, self.scale_factor_visium]
+        train_tensors = [self.Px, self.W, self.scale_factor_visium, self.scale_factor_xenium]
             
         # Add GCN parameters
         # for layer in self.gcn_layers:
         #     train_tensors.extend(list(layer.parameters()))
         
         # Add GAT parameters for Visium feature computation
-        # train_tensors.extend(list(self.visium_gat.parameters()))
+        train_tensors.extend(list(self.visium_gat.parameters()))
 
         train_tensors.extend(list(self.xenium_gat.parameters()))
         
@@ -353,32 +363,33 @@ class joint_model(torch.nn.Module):
                 best_state = {
                     'Px': self.Px.clone(),
                     'W': self.W.clone(),
-                    'gene_sf': self.gene_sf.clone(),
+                    # 'gene_sf': self.gene_sf.clone(),
                     'scale_factor_visium': self.scale_factor_visium.clone(),
-                    # 'scale_factor_xenium': self.scale_factor_xenium.clone(),
+                    'scale_factor_xenium': self.scale_factor_xenium.clone(),
                 }
             
             if self.callback(epoch, run_loss, print_freq=print_freq):
-                early_stop = True
-                break
-        
+                # early_stop = True
+                # break
+                pass
+        """
         # Restore best model state if we have one and early stopping was triggered
         if early_stop and best_state is not None:
             with torch.no_grad():
                 self.Px.copy_(best_state['Px'])
                 self.W.copy_(best_state['W'])
-                self.gene_sf.copy_(best_state['gene_sf'])
+                # self.gene_sf.copy_(best_state['gene_sf'])
                 self.scale_factor_visium.copy_(best_state['scale_factor_visium'])
-                # self.scale_factor_xenium.copy_(best_state['scale_factor_xenium'])
-
+                self.scale_factor_xenium.copy_(best_state['scale_factor_xenium'])
+        """
         # Return items of interest
         with torch.no_grad():
             return {
                 "F": dcn(self.F_soft),  # Return the spatially smoothed factors
                 "W": dcn(self.W_soft),  # Return the new loading matrix
-                "gene_sf": dcn(self.gene_sf),
+                # "gene_sf": dcn(self.gene_sf),
                 "scale_factor_visium": dcn(self.scale_factor_visium),
-                # "scale_factor_xenium": dcn(self.scale_factor_xenium),
+                "scale_factor_xenium": dcn(self.scale_factor_xenium),
                 "training_history": training_history,
                 "losses": losses
             }
